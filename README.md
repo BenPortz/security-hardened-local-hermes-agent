@@ -137,7 +137,3 @@ security properties depend on the host-level controls described there being in p
 Built on the [Hermes Agent](https://github.com/NousResearch/hermes-agent) harness and an
 OpenAI-compatible local inference server. Both are replaceable: the harness is invoked as a
 subprocess behind one constant, and the model endpoint is one line of config.
-
-## License
-
-MIT. See [LICENSE](LICENSE).

@@ -54,6 +54,8 @@ DEFAULT_QUERY = os.environ.get("GMAIL_QUERY", "newer_than:1d")
 MAX_MESSAGES = int(os.environ.get("GMAIL_MAX", "25"))
 BODY_MAX = 8000                                # triage doesn't need the whole body
 HTTP_TIMEOUT = 20
+LIST_PAGE_SIZE = 500                           # Gmail's maximum page size
+LIST_MAX_PAGES = 20                            # safety stop; far past any sane query window
 
 
 def now() -> str:
@@ -126,9 +128,32 @@ def _api_get(path: str, token: str, params: dict | None = None) -> dict:
         return json.loads(r.read().decode())
 
 
-def list_message_ids(token: str, query: str, maxn: int) -> list[str]:
-    out = _api_get("/messages", token, {"q": query, "maxResults": maxn})
-    return [m["id"] for m in out.get("messages", [])]
+def list_message_ids(token: str, query: str, max_pages: int = LIST_MAX_PAGES) -> list[str]:
+    """Every message id matching the query, newest first, following pagination.
+
+    Deliberately not limited by the caller's --max. Capping the listing is what allows a
+    burst of new mail to hide older un-fetched messages: they fall below the cut, are never
+    listed again, and age out of the query window without ever being ingested. A sender who
+    can flood the mailbox could use that to suppress one specific message.
+    """
+    ids: list[str] = []
+    page = None
+    for _ in range(max_pages):
+        params = {"q": query, "maxResults": LIST_PAGE_SIZE}
+        if page:
+            params["pageToken"] = page
+        out = _api_get("/messages", token, params)
+        ids.extend(m["id"] for m in out.get("messages", []))
+        page = out.get("nextPageToken")
+        if not page:
+            break
+    return ids
+
+
+def record_exists(mid: str) -> bool:
+    """True if this message is already on disk. Pre-filter, so an already-ingested message
+    costs no API call."""
+    return (INBOX / f"gmail-{mid}.json").exists()
 
 
 def get_message(token: str, mid: str) -> dict:
@@ -234,9 +259,16 @@ def fetch(query: str = DEFAULT_QUERY, maxn: int = MAX_MESSAGES, dry_run: bool = 
     tok = ensure_fresh(tok)
     access = tok["access_token"]
 
-    ids = list_message_ids(access, query, maxn)
+    listed = list_message_ids(access, query)
+    # Gmail lists newest first, so take the OLDEST un-ingested messages. A burst of new mail
+    # can then delay the backlog but never displace it, and anything beyond --max stays
+    # queued for the next run instead of being silently dropped.
+    pending = [mid for mid in listed if not record_exists(mid)]
+    pending.reverse()
+    selected = pending[:maxn]
+
     new = 0
-    for mid in ids:
+    for mid in selected:
         rec = parse_message(get_message(access, mid))
         if dry_run:
             print(json.dumps({k: rec[k] for k in ("id", "from", "subject", "date")}))
@@ -250,8 +282,12 @@ def fetch(query: str = DEFAULT_QUERY, maxn: int = MAX_MESSAGES, dry_run: bool = 
     audit_logger.log_event(
         "gmail_fetch", "email.read", target="inbox", log_path=AUDIT_LOG,
         external_host=GMAIL_HOST, credential_touched=CREDENTIAL_ID,
-        payload_summary=f"query={query!r} listed={len(ids)} new={new}"
+        payload_summary=f"query={query!r} listed={len(listed)} pending={len(pending)} "
+                        f"new={new} deferred={len(pending) - len(selected)}"
         + (" (dry-run)" if dry_run else ""))
+    if len(pending) > len(selected):
+        print(f"note: {len(pending) - len(selected)} further matching message(s) not fetched "
+              f"this run (--max {maxn}); queued for the next run", file=sys.stderr)
     return new
 
 
@@ -301,6 +337,7 @@ def self_test() -> int:
     try:
         assert write_record(rec) is True, "first write should create the record"
         assert write_record(rec) is False, "second write must be idempotent (skip existing)"
+        assert record_exists("SAMPLE123") is True, "record_exists must see the written record"
         (INBOX / (rec["id"] + ".json")).unlink()
         INBOX.rmdir()
     finally:
@@ -315,12 +352,15 @@ def main() -> None:
     ap.add_argument("--self-test", action="store_true", help="run offline parse/writer test (no creds)")
     ap.add_argument("--dry-run", action="store_true", help="fetch + parse but do not write records")
     ap.add_argument("--query", default=DEFAULT_QUERY, help="Gmail search query (default: newer_than:1d)")
-    ap.add_argument("--max", type=int, default=MAX_MESSAGES, help="max messages per run")
+    ap.add_argument("--max", type=int, default=MAX_MESSAGES, help="max NEW messages ingested per run; older matches stay queued")
     args = ap.parse_args()
     if args.self_test:
         sys.exit(self_test())
     n = fetch(query=args.query, maxn=args.max, dry_run=args.dry_run)
-    print(f"{n} new message(s) written to {INBOX}")
+    if args.dry_run:
+        print(f"{n} new message(s) would be written to {INBOX} (dry-run, nothing written)")
+    else:
+        print(f"{n} new message(s) written to {INBOX}")
 
 
 if __name__ == "__main__":

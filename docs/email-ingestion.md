@@ -135,8 +135,12 @@ The gate is structural at each step, and the agent is not in the send path at al
 
 - Start narrow. Run the first fetch with a tight query and a small `--max` to check the
   pipeline before pulling in bulk.
-- `--max` caps the listing, not the number of new records. A large cold-start backlog will not
-  drain on its own, and the oldest messages never appear. Widen the query once to catch up,
-  then return to the normal schedule.
+- `--max` caps the number of NEW records ingested per run, not the listing. The fetcher pages
+  the full query window, skips what is already on disk, and takes the OLDEST pending messages
+  first, so a backlog drains across successive runs. This ordering is a security property, not
+  just tidiness: capping the listing instead would let anyone able to send mail push an older
+  message below the cut, where it would age out of the window without ever being ingested. A
+  run that leaves messages queued reports the count on stderr, and
+  `tests/test_fetch_backlog.py` covers the case offline.
 - Re-run the egress negative test after opening the mail allow, and confirm two things: that
   only the mail API opened, and that the agent's own interpreter is still loopback-only.
